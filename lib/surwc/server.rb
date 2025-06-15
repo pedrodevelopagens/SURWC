@@ -10,10 +10,10 @@ module SURWC
   class Server
     def initialize(port: 4567, public_root: nil)
       @port = port
-      @routes = { 'GET' => [], 'POST' => [] }
+      @routes = { 'GET' => [], 'POST' => [], 'PUT' => [], 'DELETE' => [] }
       @global_middlewares = []
       @public_root = public_root || File.join(Dir.pwd, 'public')
-      
+
       # Configuração UTF-8 para o ambiente
       Encoding.default_external = Encoding::UTF_8
       Encoding.default_internal = Encoding::UTF_8
@@ -25,6 +25,14 @@ module SURWC
 
     def post(path, options = {}, &handler)
       add_route('POST', path, handler, options)
+    end
+
+    def put(path, options = {}, &handler)
+      add_route('PUT', path, handler, options)
+    end
+
+    def delete(path, options = {}, &handler)
+      add_route('DELETE', path, handler, options)
     end
 
     def use(&middleware)
@@ -67,16 +75,18 @@ module SURWC
       request_line = client.gets or return client.close
 
       begin
-        method, full_path = request_line.split.tap { |m| break [m[0], m[1]] }
+        method, full_path = request_line.split
         path, query = full_path.split('?', 2)
+
+        headers = parse_headers(client)
 
         req = {
           method: method,
           path: path,
           query: query ? CGI.parse(query).transform_values(&:first) : {},
-          headers: parse_headers(client),
+          headers: headers,
           params: {},
-          body: parse_body(client, method)
+          body: parse_body(client, method, headers)
         }
 
         route = @routes[method]&.find { |r| r[:pattern].match(path) } or
@@ -84,7 +94,7 @@ module SURWC
 
         extract_params(req, route)
         run_middlewares(req, route)
-        
+
         response = route[:handler].call(req)
         content = response.is_a?(String) ? response : response.to_json
         send_response(client, 200, content)
@@ -104,13 +114,15 @@ module SURWC
       headers
     end
 
-    def parse_body(client, method)
+    def parse_body(client, method, headers)
       return unless %w[POST PUT PATCH].include?(method)
-      length = client.headers['Content-Length'].to_i
+
+      length = headers['Content-Length'].to_i
       return unless length.positive?
 
       raw_body = client.read(length)
-      if client.headers['Content-Type']&.include?('application/json')
+
+      if headers['Content-Type']&.include?('application/json')
         JSON.parse(raw_body) rescue raw_body
       else
         raw_body
@@ -142,7 +154,7 @@ module SURWC
 
       # Mescla headers personalizados mantendo o charset UTF-8
       merged_headers = default_headers.merge(headers) do |key, oldval, newval|
-        key.casecmp?('content-type') && !newval.include?('charset=') ? 
+        key.casecmp?('content-type') && !newval.include?('charset=') ?
           "#{newval}; charset=utf-8" : newval
       end
 
