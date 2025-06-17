@@ -5,35 +5,83 @@ require 'cgi'
 require 'json'
 require 'erb'
 require 'pathname'
+require 'time'
 
 module SURWC
+  class Cookies
+    def initialize(req)
+      @req = req
+      @cookies = parse_cookies(req[:headers]['Cookie'])
+      @cookies_to_set = []
+    end
+
+    def parse_cookies(cookie_header)
+      return {} unless cookie_header
+      cookie_header.split('; ').map { |c| c.split('=', 2) }.to_h.transform_values { |v| CGI.unescape(v) }
+    end
+
+    def get(name = nil)
+      return @cookies if name.nil?
+      @cookies[name]
+    end
+
+    def get_all
+      @cookies.map { |key, value| { key => value } }
+    end
+
+    def to_hash
+      @cookies.dup
+    end
+
+    def has?(name)
+      @cookies.key?(name)
+    end
+
+    def set(name, value, options = {})
+      cookie = build_cookie(name, value, options)
+      @cookies_to_set << cookie
+    end
+
+    def delete(name, options = {})
+      set(name, '', options.merge(max_age: 0))
+    end
+
+    def cookies_to_set
+      @cookies_to_set
+    end
+
+    private
+
+    def build_cookie(name, value, options = {})
+      cookie = "#{name}=#{CGI.escape(value.to_s)}"
+      cookie << "; Path=#{options[:path]}" if options[:path]
+      cookie << "; Domain=#{options[:domain]}" if options[:domain]
+      cookie << "; Max-Age=#{options[:max_age]}" if options[:max_age]
+      cookie << "; Expires=#{options[:expires].httpdate}" if options[:expires]
+      cookie << "; HttpOnly" if options[:httponly]
+      cookie << "; Secure" if options[:secure]
+      cookie << "; SameSite=#{options[:samesite]}" if options[:samesite]
+      cookie
+    end
+  end
+
   class Server
     def initialize(port: 4567, public_root: nil)
       @port = port
-      @routes = { 'GET' => [], 'POST' => [], 'PUT' => [], 'DELETE' => [] }
+      @routes = { 'GET' => [], 'POST' => [], 'PUT' => [], 'DELETE' => [], 'PATCH' => [], 'OPTIONS' => [] }
       @global_middlewares = []
       @public_root = public_root || File.join(Dir.pwd, 'public')
 
-      # Configuração UTF-8 para o ambiente
       Encoding.default_external = Encoding::UTF_8
       Encoding.default_internal = Encoding::UTF_8
     end
 
-    def get(path, options = {}, &handler)
-      add_route('GET', path, handler, options)
-    end
-
-    def post(path, options = {}, &handler)
-      add_route('POST', path, handler, options)
-    end
-
-    def put(path, options = {}, &handler)
-      add_route('PUT', path, handler, options)
-    end
-
-    def delete(path, options = {}, &handler)
-      add_route('DELETE', path, handler, options)
-    end
+    def get(path, options = {}, &handler)     = add_route('GET', path, handler, options)
+    def post(path, options = {}, &handler)    = add_route('POST', path, handler, options)
+    def put(path, options = {}, &handler)     = add_route('PUT', path, handler, options)
+    def delete(path, options = {}, &handler)  = add_route('DELETE', path, handler, options)
+    def patch(path, options = {}, &handler)   = add_route('PATCH', path, handler, options)
+    def options(path, options = {}, &handler) = add_route('OPTIONS', path, handler, options)
 
     def use(&middleware)
       @global_middlewares << middleware
@@ -67,7 +115,10 @@ module SURWC
 
     def compile_path(path)
       keys = []
-      pattern = path.gsub(%r{/:(\w+)}) { keys << $1; '/([^/]+)' }
+      pattern = path.gsub(%r{/:(\w+)}) do
+        keys << Regexp.last_match(1)
+        '/([^/]+)'
+      end
       [Regexp.new("^#{pattern}$"), keys]
     end
 
@@ -89,17 +140,23 @@ module SURWC
           body: parse_body(client, method, headers)
         }
 
-        route = @routes[method]&.find { |r| r[:pattern].match(path) } or
-          return send_response(client, 404, 'Not Found')
+        req[:cookies] = Cookies.new(req)
+
+        route = @routes[method]&.find { |r| r[:pattern].match(path) }
+
+        if route.nil?
+          return send_response(client, 404, render_error_page(404, 'Página não encontrada'))
+        end
 
         extract_params(req, route)
         run_middlewares(req, route)
 
         response = route[:handler].call(req)
         content = response.is_a?(String) ? response : response.to_json
-        send_response(client, 200, content)
+
+        send_response(client, 200, content, {}, req[:cookies])
       rescue => e
-        send_response(client, 500, e.message)
+        send_response(client, 500, render_error_page(500, e.message))
       ensure
         client.close
       end
@@ -123,7 +180,11 @@ module SURWC
       raw_body = client.read(length)
 
       if headers['Content-Type']&.include?('application/json')
-        JSON.parse(raw_body) rescue raw_body
+        begin
+          JSON.parse(raw_body)
+        rescue
+          raw_body
+        end
       else
         raw_body
       end
@@ -145,20 +206,25 @@ module SURWC
       nil
     end
 
-    def send_response(client, status, body, headers = {})
-      # Configura headers padrão com UTF-8
+    def send_response(client, status, body, headers = {}, cookies = nil)
       default_headers = {
         'Content-Type' => 'text/html; charset=utf-8',
         'Content-Length' => body.to_s.bytesize
       }
 
-      # Mescla headers personalizados mantendo o charset UTF-8
-      merged_headers = default_headers.merge(headers) do |key, oldval, newval|
-        key.casecmp?('content-type') && !newval.include?('charset=') ?
-          "#{newval}; charset=utf-8" : newval
+      if cookies
+        cookie_headers = cookies.cookies_to_set.map { |c| ["Set-Cookie", c] }.to_h
+        headers = headers.merge(cookie_headers)
       end
 
-      # Monta a resposta HTTP
+      merged_headers = default_headers.merge(headers) do |key, _oldval, newval|
+        if key.casecmp?('content-type') && !newval.include?('charset=')
+          "#{newval}; charset=utf-8"
+        else
+          newval
+        end
+      end
+
       response = "HTTP/1.1 #{status}\r\n"
       merged_headers.each { |k, v| response << "#{k}: #{v}\r\n" }
       response << "\r\n#{body}"
@@ -178,16 +244,25 @@ module SURWC
       end
     end
 
-    def try_serve_static(req, res)
-      path = req[:path] == '/' ? 'index.html' : req[:path][1..]
-      static_file = File.join(@public_root, path)
-
-      if File.exist?(static_file) && !File.directory?(static_file)
-        res.send(render(path))
-        true
-      else
-        false
-      end
+    def render_error_page(code, message)
+      <<~HTML
+        <!DOCTYPE html>
+        <html lang="pt-br">
+        <head>
+          <meta charset="UTF-8">
+          <title>Erro #{code}</title>
+          <style>
+            body { background: #111; color: #eee; font-family: sans-serif; text-align: center; padding: 5em; }
+            h1 { font-size: 4em; margin-bottom: 0.5em; }
+            p { color: #888; }
+          </style>
+        </head>
+        <body>
+          <h1>Erro #{code}</h1>
+          <p>#{message}</p>
+        </body>
+        </html>
+      HTML
     end
   end
 end
